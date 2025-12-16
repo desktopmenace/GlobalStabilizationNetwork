@@ -1,0 +1,57 @@
+# Virtual environment
+gsn_env/
+venv/
+.venv/
+env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Large data files (download separately)
+*.nc
+*.bsp
+*.csv
+*.xlsx
+*.xls
+*.pdf
+*.tif
+*.tfw
+*.grd
+*.kmz
+*.xyz
+*.npz
+
+# Data directories
+gsn_data/
+cache/
+crustal age/
+crustal age copy/
+GHFDB-R2024/
+
+# ML model checkpoints (can be retrained)
+*.pth
+
+# Optimization results
+ml_optimization_*.json
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Streamlit
+.streamlit/
+
+# Jupyter
+.ipynb_checkpoints/
+
