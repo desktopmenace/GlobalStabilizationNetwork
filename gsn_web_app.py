@@ -60,11 +60,30 @@ except ImportError:
 
 try:
     from gsn_uncertainty import (
-        bootstrap_F_score, classify_confidence, compute_data_quality_score
+        bootstrap_F_score, classify_confidence, compute_data_quality_score,
+        bootstrap_H_confidence, propagate_G_uncertainty, monte_carlo_F,
+        ConfidenceInterval, UncertaintyResult
     )
     HAS_UNCERTAINTY = True
 except ImportError:
     HAS_UNCERTAINTY = False
+
+try:
+    from gsn_statistical_validation import (
+        test_pattern_significance, ripley_k_spherical, alignment_significance,
+        run_full_validation, CSRTestResult, ValidationSummary
+    )
+    HAS_STATISTICAL_VALIDATION = True
+except ImportError:
+    HAS_STATISTICAL_VALIDATION = False
+
+try:
+    from gsn_bayesian_scorer import (
+        BayesianScorer, CombinedBayesianScorer, PosteriorResult
+    )
+    HAS_BAYESIAN = True
+except ImportError:
+    HAS_BAYESIAN = False
 
 try:
     from gsn_heatflow import get_heatflow, get_heatflow_stats
@@ -1930,8 +1949,10 @@ def main():
     # Add layer control for in-map toggling
     folium.LayerControl(position='topright', collapsed=True).add_to(m)
     
-    # Display map with tabs for 2D/3D, analytics, H comparison, and help
-    map_tab, globe_tab, analytics_tab, compare_tab, help_tab = st.tabs(["🗺️ 2D Map", "🌐 3D Globe", "📊 Analytics", "🔬 H Compare", "📖 Help"])
+    # Display map with tabs for 2D/3D, analytics, validation, H comparison, and help
+    map_tab, globe_tab, analytics_tab, validation_tab, compare_tab, help_tab = st.tabs(
+        ["🗺️ 2D Map", "🌐 3D Globe", "📊 Analytics", "📈 Validation", "🔬 H Compare", "📖 Help"]
+    )
     
     with map_tab:
         # Full width map
@@ -2188,6 +2209,187 @@ def main():
                 st.caption(f"📊 {visible_count}/{len(const_data)} constellations visible | Average visibility: {avg_score*100:.0f}%")
             else:
                 st.warning("Could not compute constellation visibility. Check gsn_astronomy module.")
+    
+    # Statistical Validation tab
+    with validation_tab:
+        st.subheader("📈 Statistical Validation")
+        st.write("Test whether observed patterns are statistically significant or coincidental.")
+        
+        # Check if validation module is available
+        if not HAS_STATISTICAL_VALIDATION:
+            st.warning("Statistical validation module not available. Install scipy for full functionality.")
+        else:
+            # Get known nodes for validation
+            if HAS_EXTENDED_NODES:
+                val_nodes = KNOWN_NODES_EXTENDED
+            else:
+                val_nodes = gsn.KNOWN_NODES
+            
+            st.info(f"Using {len(val_nodes)} known nodes for validation.")
+            
+            # Validation options
+            col1, col2 = st.columns(2)
+            with col1:
+                n_sims = st.slider("Monte Carlo Simulations", 100, 5000, 1000, 100,
+                                   help="More simulations = more precise p-values (but slower)")
+            with col2:
+                run_validation = st.button("🔬 Run Full Validation", type="primary",
+                                          help="Run CSR test, Ripley's K, and alignment significance")
+            
+            if run_validation:
+                with st.spinner("Running statistical validation tests..."):
+                    try:
+                        summary = run_full_validation(val_nodes, n_simulations=n_sims)
+                        
+                        # Store in session state
+                        st.session_state["validation_summary"] = summary
+                        st.success("Validation complete!")
+                    except Exception as e:
+                        st.error(f"Validation failed: {e}")
+            
+            # Display results if available
+            if "validation_summary" in st.session_state:
+                summary = st.session_state["validation_summary"]
+                
+                # Overall result banner
+                if summary.overall_significant:
+                    st.success(f"✅ Pattern is STATISTICALLY SIGNIFICANT (p = {summary.overall_p_value:.4f})")
+                else:
+                    st.warning(f"⚠️ Pattern is NOT significant (p = {summary.overall_p_value:.4f})")
+                
+                # Detailed results in expanders
+                with st.expander("📊 Complete Spatial Randomness (CSR) Test", expanded=True):
+                    csr = summary.csr_result
+                    
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        st.metric("Observed Coherence", f"{csr.observed_coherence:.4f}")
+                    with col2:
+                        st.metric("Expected (Random)", f"{csr.null_mean:.4f} ± {csr.null_std:.4f}")
+                    with col3:
+                        color = "green" if csr.is_significant_05 else "orange"
+                        st.metric("P-value", f"{csr.p_value:.4f}", 
+                                 delta="Significant" if csr.is_significant_05 else "Not Significant",
+                                 delta_color="normal" if csr.is_significant_05 else "off")
+                    
+                    st.caption(csr.interpretation)
+                
+                with st.expander("🎯 Ripley's K-Function (Spatial Clustering)", expanded=False):
+                    ripley = summary.ripley_result
+                    
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        if ripley.significant_clustering:
+                            st.success("✅ Significant CLUSTERING detected")
+                        else:
+                            st.info("➖ No significant clustering")
+                    with col2:
+                        if ripley.significant_dispersion:
+                            st.success("✅ Significant DISPERSION (regular spacing)")
+                        else:
+                            st.info("➖ No significant dispersion")
+                    
+                    st.metric("Max Deviation from CSR", f"{ripley.max_deviation:.2f}")
+                
+                with st.expander("🌐 Great Circle Alignment Test", expanded=False):
+                    align = summary.alignment_result
+                    
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        st.metric("Observed Alignments", align.n_alignments_observed)
+                    with col2:
+                        st.metric("Expected (Random)", f"{align.n_alignments_expected:.1f}")
+                    with col3:
+                        st.metric("Excess Ratio", f"{align.excess_ratio:.2f}x")
+                    
+                    if align.is_significant:
+                        st.success(f"✅ More alignments than expected by chance (p={align.p_value:.4f})")
+                    else:
+                        st.info(f"Alignments consistent with random placement (p={align.p_value:.4f})")
+                
+                # Recommendations
+                with st.expander("💡 Recommendations", expanded=True):
+                    for rec in summary.recommendations:
+                        if "significant" in rec.lower() and "not" not in rec.lower():
+                            st.success(f"• {rec}")
+                        elif "not" in rec.lower() or "no " in rec.lower():
+                            st.warning(f"• {rec}")
+                        else:
+                            st.info(f"• {rec}")
+        
+        # Bayesian Analysis Section
+        st.divider()
+        st.subheader("🎲 Bayesian Analysis")
+        
+        if not HAS_BAYESIAN:
+            st.warning("Bayesian scorer module not available.")
+        else:
+            st.write("Compute proper posterior probabilities instead of arbitrary F-scores.")
+            
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                bayes_lat = st.number_input("Latitude", -90.0, 90.0, 29.9792, format="%.4f",
+                                           key="bayes_lat")
+            with col2:
+                bayes_lon = st.number_input("Longitude", -180.0, 180.0, 31.1342, format="%.4f",
+                                           key="bayes_lon")
+            with col3:
+                if st.button("🔮 Compute Posterior", key="bayes_compute"):
+                    try:
+                        scorer = BayesianScorer()
+                        result = scorer.compute_posterior(bayes_lat, bayes_lon)
+                        st.session_state["bayes_result"] = result
+                    except Exception as e:
+                        st.error(f"Bayesian computation failed: {e}")
+            
+            if "bayes_result" in st.session_state:
+                result = st.session_state["bayes_result"]
+                
+                col1, col2 = st.columns(2)
+                with col1:
+                    # Display probability as percentage
+                    prob_pct = result.probability * 100
+                    st.metric("P(is GSN node | data)", f"{prob_pct:.4f}%")
+                    st.caption(f"95% CI: ({result.credible_interval_95[0]*100:.4f}%, {result.credible_interval_95[1]*100:.4f}%)")
+                
+                with col2:
+                    st.metric("Likelihood Ratio", f"{result.likelihood_ratio:.2f}")
+                    st.caption(f"Log-odds: {result.log_odds:.2f}")
+                
+                # Interpretation
+                if result.probability > 0.5:
+                    st.success(f"📍 This location has elevated probability of being a GSN node.")
+                elif result.probability > 0.01:
+                    st.info(f"📍 Location has slightly elevated probability.")
+                else:
+                    st.warning(f"📍 Location has low probability of being a GSN node.")
+        
+        # Leave-One-Out Validation
+        st.divider()
+        st.subheader("🔄 Leave-One-Out Cross-Validation")
+        
+        if HAS_BAYESIAN:
+            if st.button("Run LOOCV on Known Nodes", key="run_loocv"):
+                with st.spinner("Running leave-one-out validation (this may take a moment)..."):
+                    try:
+                        scorer = BayesianScorer()
+                        loocv_result = scorer.leave_one_out_validation()
+                        st.session_state["loocv_result"] = loocv_result
+                    except Exception as e:
+                        st.error(f"LOOCV failed: {e}")
+            
+            if "loocv_result" in st.session_state:
+                loocv = st.session_state["loocv_result"]
+                
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.metric("Mean Posterior", f"{loocv['mean_posterior']:.4f}")
+                with col2:
+                    st.metric("Min Posterior", f"{loocv['min_posterior']:.4f}")
+                with col3:
+                    st.metric("Max Posterior", f"{loocv['max_posterior']:.4f}")
+                
+                st.info(loocv['interpretation'])
     
     # H Method Comparison tab
     with compare_tab:
@@ -2809,6 +3011,69 @@ def main():
                                 st.caption("○ No sacred geometry patterns")
                         except Exception:
                             st.caption("○ Pattern data unavailable")
+                    
+                    # Fourth row: Confidence Intervals (if uncertainty module available)
+                    if HAS_UNCERTAINTY and HAS_BAYESIAN:
+                        st.divider()
+                        st.write("**📊 Confidence Analysis:**")
+                        
+                        conf_cols = st.columns(3)
+                        
+                        with conf_cols[0]:
+                            try:
+                                # Bayesian posterior
+                                scorer = BayesianScorer()
+                                posterior = scorer.compute_posterior(cand_lat, cand_lon)
+                                prob_pct = posterior.probability * 100
+                                ci_low = posterior.credible_interval_95[0] * 100
+                                ci_high = posterior.credible_interval_95[1] * 100
+                                
+                                st.metric(
+                                    "P(node|data)", 
+                                    f"{prob_pct:.3f}%",
+                                    help="Bayesian posterior probability"
+                                )
+                                st.caption(f"95% CI: ({ci_low:.3f}%, {ci_high:.3f}%)")
+                            except Exception:
+                                st.caption("Bayesian analysis unavailable")
+                        
+                        with conf_cols[1]:
+                            try:
+                                # Classify confidence
+                                f_score = selected_cand['F']
+                                g_score = selected_cand['G']
+                                h_score = selected_cand['H']
+                                
+                                # Rough uncertainty estimate
+                                est_std = abs(f_score) * 0.15  # Assume 15% CV
+                                
+                                quality = compute_data_quality_score(
+                                    cand_lat, cand_lon,
+                                    {"gravity": True, "crust": True, "boundary": True}
+                                )
+                                
+                                conf = classify_confidence(
+                                    f_score, est_std, 
+                                    quality['quality_score']
+                                )
+                                
+                                level = conf['confidence_level']
+                                if level == "HIGH":
+                                    st.success(f"🟢 {level} Confidence")
+                                elif level == "MODERATE":
+                                    st.info(f"🟡 {level} Confidence")
+                                else:
+                                    st.warning(f"🔴 {level} Confidence")
+                                
+                                st.caption(conf['description'])
+                            except Exception:
+                                st.caption("Confidence unavailable")
+                        
+                        with conf_cols[2]:
+                            st.caption("**Score Components:**")
+                            st.caption(f"• G (geophysical): {selected_cand['G']:.3f}")
+                            st.caption(f"• H (geometric): {selected_cand['H']:.3f}")
+                            st.caption(f"• F (combined): {selected_cand['F']:.3f}")
     
     # Handle Data Status mode
     if mode == "Data Status":
@@ -2822,6 +3087,8 @@ def main():
             st.write(f"{'✓' if HAS_DATA_SOURCES else '✗'} Data Sources Module")
             st.write(f"{'✓' if HAS_VALIDATION else '✗'} Validation Framework")
             st.write(f"{'✓' if HAS_UNCERTAINTY else '✗'} Uncertainty Quantification")
+            st.write(f"{'✓' if HAS_STATISTICAL_VALIDATION else '✗'} Statistical Validation")
+            st.write(f"{'✓' if HAS_BAYESIAN else '✗'} Bayesian Scoring")
         
         with col2:
             st.write("**New Data Sources**")

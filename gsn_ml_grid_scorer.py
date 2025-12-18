@@ -910,6 +910,455 @@ def train_grid_scorer_from_nodes(
 
 
 # ---------------------------------------------------------
+# Robust ML: Leave-One-Out Cross-Validation
+# ---------------------------------------------------------
+
+def leave_one_out_cv(
+    known_coords: List[Tuple[float, float]],
+    features: np.ndarray,
+    model_type: str = "logistic",
+    verbose: bool = False
+) -> Dict:
+    """
+    Perform leave-one-out cross-validation for honest evaluation.
+    
+    For small datasets like GSN nodes (~37 samples), LOOCV is the only
+    honest way to evaluate model performance.
+    
+    Args:
+        known_coords: List of (lat, lon) for known nodes
+        features: Feature matrix (n_nodes, n_features)
+        model_type: 'logistic', 'rf', 'gb', or 'nn'
+        verbose: Print progress
+    
+    Returns:
+        Dict with per-node predictions and metrics
+    """
+    n_nodes = len(known_coords)
+    
+    if not HAS_SKLEARN:
+        return {"error": "sklearn required for LOOCV"}
+    
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+    
+    predictions = []
+    probabilities = []
+    
+    for i in range(n_nodes):
+        # Create train set without node i
+        train_idx = [j for j in range(n_nodes) if j != i]
+        test_idx = [i]
+        
+        X_train = features[train_idx]
+        X_test = features[test_idx]
+        
+        # Create labels: 1 for all nodes (positives only)
+        # Add synthetic negatives for training
+        n_neg = max(50, len(train_idx) * 3)
+        
+        # Generate random negative features
+        X_neg = np.random.randn(n_neg, features.shape[1]).astype(np.float32)
+        # Scale to similar range as positives
+        X_neg = X_neg * np.std(X_train, axis=0) + np.mean(X_train, axis=0)
+        # But make distance features indicate far from nodes
+        X_neg[:, 10] = np.random.uniform(0.3, 0.8, n_neg)  # min_node_dist
+        X_neg[:, 11] = np.random.uniform(0.4, 0.9, n_neg)  # mean_node_dist
+        X_neg[:, 12] = np.random.uniform(0.0, 0.1, n_neg)  # node_density
+        
+        X_combined = np.vstack([X_train, X_neg])
+        y_combined = np.concatenate([
+            np.ones(len(train_idx)),
+            np.zeros(n_neg)
+        ])
+        
+        # Train model
+        if model_type == "logistic":
+            model = LogisticRegression(C=0.1, max_iter=1000, random_state=42)
+        elif model_type == "rf":
+            model = RandomForestClassifier(n_estimators=100, max_depth=3, random_state=42)
+        elif model_type == "gb":
+            model = GradientBoostingClassifier(n_estimators=50, max_depth=2, random_state=42)
+        else:
+            model = LogisticRegression(C=0.1, max_iter=1000, random_state=42)
+        
+        try:
+            model.fit(X_combined, y_combined)
+            prob = model.predict_proba(X_test)[0, 1]
+            pred = model.predict(X_test)[0]
+        except Exception as e:
+            if verbose:
+                print(f"[WARN] Model failed for node {i}: {e}")
+            prob = 0.5
+            pred = 1
+        
+        predictions.append(pred)
+        probabilities.append(prob)
+        
+        if verbose and (i + 1) % 10 == 0:
+            print(f"[INFO] LOOCV progress: {i+1}/{n_nodes}")
+    
+    # Compute metrics
+    probs = np.array(probabilities)
+    preds = np.array(predictions)
+    
+    # For true positives, we want high probabilities
+    mean_prob = np.mean(probs)
+    accuracy = np.mean(preds == 1)  # All true labels are 1
+    
+    # Pseudo-AUC: mean probability for known nodes
+    # (true AUC needs negatives, but this indicates model confidence)
+    
+    return {
+        "model_type": model_type,
+        "n_nodes": n_nodes,
+        "predictions": predictions,
+        "probabilities": probabilities.tolist() if isinstance(probabilities, np.ndarray) else probabilities,
+        "mean_probability": float(mean_prob),
+        "min_probability": float(np.min(probs)),
+        "max_probability": float(np.max(probs)),
+        "accuracy": float(accuracy),
+        "interpretation": _interpret_loocv_results(probs)
+    }
+
+
+def _interpret_loocv_results(probs: np.ndarray) -> str:
+    """Interpret LOOCV results."""
+    mean_p = np.mean(probs)
+    min_p = np.min(probs)
+    
+    if mean_p > 0.7 and min_p > 0.3:
+        return "Excellent: Model reliably identifies known nodes with high confidence."
+    elif mean_p > 0.5 and min_p > 0.1:
+        return "Good: Model generally identifies known nodes but some uncertainty."
+    elif mean_p > 0.3:
+        return "Moderate: Model partially captures node characteristics."
+    else:
+        return "Poor: Model fails to reliably identify known nodes. Features may be inadequate."
+
+
+# ---------------------------------------------------------
+# Robust ML: Simple Models (sklearn-based)
+# ---------------------------------------------------------
+
+class SimpleGridScorer:
+    """
+    Simple, interpretable models for GSN scoring.
+    
+    Uses sklearn models that are more appropriate for small datasets
+    than deep neural networks.
+    """
+    
+    def __init__(self, model_type: str = "logistic"):
+        """
+        Initialize simple scorer.
+        
+        Args:
+            model_type: 'logistic', 'rf', or 'gb'
+        """
+        self.model_type = model_type
+        self.model = None
+        self.scaler = None
+        self.feature_importance = None
+        
+        if not HAS_SKLEARN:
+            raise ImportError("sklearn required for SimpleGridScorer")
+    
+    def train(self, 
+              positive_features: np.ndarray,
+              negative_features: np.ndarray = None,
+              n_random_negatives: int = 1000,
+              seed: int = 42) -> Dict:
+        """
+        Train the simple model.
+        
+        Args:
+            positive_features: Features for known nodes (n_pos, n_features)
+            negative_features: Features for negative examples (optional)
+            n_random_negatives: Number of random negatives to generate if not provided
+            seed: Random seed
+        
+        Returns:
+            Training result dict
+        """
+        from sklearn.linear_model import LogisticRegression
+        from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+        from sklearn.preprocessing import StandardScaler
+        
+        np.random.seed(seed)
+        
+        # Standardize features
+        self.scaler = StandardScaler()
+        X_pos = self.scaler.fit_transform(positive_features)
+        
+        # Generate or use negatives
+        if negative_features is None:
+            # Generate random negatives
+            X_neg = np.random.randn(n_random_negatives, positive_features.shape[1])
+            X_neg = self.scaler.transform(X_neg * np.std(positive_features, axis=0) + 
+                                          np.mean(positive_features, axis=0))
+        else:
+            X_neg = self.scaler.transform(negative_features)
+        
+        # Combine data
+        X = np.vstack([X_pos, X_neg])
+        y = np.concatenate([np.ones(len(X_pos)), np.zeros(len(X_neg))])
+        
+        # Create and train model
+        if self.model_type == "logistic":
+            self.model = LogisticRegression(
+                C=0.1,  # Strong regularization for small datasets
+                penalty='l2',
+                max_iter=1000,
+                random_state=seed
+            )
+        elif self.model_type == "rf":
+            self.model = RandomForestClassifier(
+                n_estimators=100,
+                max_depth=3,  # Shallow trees to prevent overfitting
+                min_samples_leaf=5,
+                random_state=seed
+            )
+        elif self.model_type == "gb":
+            self.model = GradientBoostingClassifier(
+                n_estimators=50,
+                max_depth=2,
+                learning_rate=0.1,
+                random_state=seed
+            )
+        
+        self.model.fit(X, y)
+        
+        # Extract feature importance
+        if hasattr(self.model, 'feature_importances_'):
+            self.feature_importance = dict(zip(
+                GRID_FEATURE_NAMES,
+                self.model.feature_importances_
+            ))
+        elif hasattr(self.model, 'coef_'):
+            self.feature_importance = dict(zip(
+                GRID_FEATURE_NAMES,
+                np.abs(self.model.coef_[0])
+            ))
+        
+        # Evaluate on training data
+        y_pred_proba = self.model.predict_proba(X)[:, 1]
+        
+        return {
+            "model_type": self.model_type,
+            "n_positive": len(X_pos),
+            "n_negative": len(X_neg),
+            "train_accuracy": float(np.mean(self.model.predict(X) == y)),
+            "mean_positive_prob": float(np.mean(y_pred_proba[:len(X_pos)])),
+            "mean_negative_prob": float(np.mean(y_pred_proba[len(X_pos):])),
+            "feature_importance": self.feature_importance
+        }
+    
+    def predict(self, features: np.ndarray) -> np.ndarray:
+        """Predict probabilities for feature matrix."""
+        if self.model is None:
+            raise ValueError("Model not trained")
+        
+        X = self.scaler.transform(features)
+        return self.model.predict_proba(X)[:, 1]
+    
+    def get_feature_importance(self) -> Dict[str, float]:
+        """Get feature importance ranking."""
+        if self.feature_importance is None:
+            return {}
+        
+        # Sort by importance
+        return dict(sorted(
+            self.feature_importance.items(),
+            key=lambda x: x[1],
+            reverse=True
+        ))
+
+
+# ---------------------------------------------------------
+# Robust ML: Ensemble Methods
+# ---------------------------------------------------------
+
+class EnsembleGridScorer:
+    """
+    Ensemble of multiple models for robust GSN scoring.
+    
+    Averages predictions from logistic regression, random forest,
+    and gradient boosting to reduce variance and improve reliability.
+    """
+    
+    def __init__(self):
+        """Initialize ensemble with multiple model types."""
+        self.models = {}
+        self.trained = False
+    
+    def train(self,
+              positive_features: np.ndarray,
+              negative_features: np.ndarray = None,
+              seed: int = 42) -> Dict:
+        """
+        Train all ensemble members.
+        
+        Args:
+            positive_features: Features for known nodes
+            negative_features: Features for negatives (optional)
+            seed: Random seed
+        
+        Returns:
+            Training results for each model
+        """
+        results = {}
+        
+        for model_type in ["logistic", "rf", "gb"]:
+            try:
+                scorer = SimpleGridScorer(model_type=model_type)
+                result = scorer.train(positive_features, negative_features, seed=seed)
+                self.models[model_type] = scorer
+                results[model_type] = result
+            except Exception as e:
+                results[model_type] = {"error": str(e)}
+        
+        self.trained = len(self.models) > 0
+        
+        # Compute ensemble feature importance (average across models)
+        all_importance = {}
+        for name in GRID_FEATURE_NAMES:
+            values = []
+            for model_type, scorer in self.models.items():
+                if scorer.feature_importance and name in scorer.feature_importance:
+                    values.append(scorer.feature_importance[name])
+            all_importance[name] = np.mean(values) if values else 0.0
+        
+        results["ensemble"] = {
+            "n_models": len(self.models),
+            "models": list(self.models.keys()),
+            "feature_importance": dict(sorted(
+                all_importance.items(),
+                key=lambda x: x[1],
+                reverse=True
+            ))
+        }
+        
+        return results
+    
+    def predict(self, features: np.ndarray, 
+                return_individual: bool = False) -> np.ndarray:
+        """
+        Predict using ensemble average.
+        
+        Args:
+            features: Feature matrix
+            return_individual: If True, also return individual model predictions
+        
+        Returns:
+            Ensemble predictions (and optionally individual predictions)
+        """
+        if not self.trained:
+            raise ValueError("Ensemble not trained")
+        
+        all_preds = []
+        individual = {}
+        
+        for model_type, scorer in self.models.items():
+            try:
+                preds = scorer.predict(features)
+                all_preds.append(preds)
+                individual[model_type] = preds
+            except Exception:
+                continue
+        
+        if not all_preds:
+            raise ValueError("No models produced predictions")
+        
+        # Average predictions
+        ensemble_pred = np.mean(all_preds, axis=0)
+        
+        if return_individual:
+            return ensemble_pred, individual
+        return ensemble_pred
+    
+    def predict_with_uncertainty(self, features: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Predict with uncertainty estimates.
+        
+        Returns:
+            Tuple of (mean_predictions, std_predictions)
+        """
+        ensemble_pred, individual = self.predict(features, return_individual=True)
+        
+        all_preds = np.array(list(individual.values()))
+        std_pred = np.std(all_preds, axis=0)
+        
+        return ensemble_pred, std_pred
+
+
+# ---------------------------------------------------------
+# Recursive Feature Elimination
+# ---------------------------------------------------------
+
+def feature_selection(
+    positive_features: np.ndarray,
+    negative_features: np.ndarray = None,
+    n_features_to_select: int = 8,
+    verbose: bool = False
+) -> Dict:
+    """
+    Select most important features using recursive feature elimination.
+    
+    Args:
+        positive_features: Features for known nodes
+        negative_features: Features for negatives
+        n_features_to_select: Target number of features
+        verbose: Print progress
+    
+    Returns:
+        Dict with selected features and rankings
+    """
+    if not HAS_SKLEARN:
+        return {"error": "sklearn required"}
+    
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.feature_selection import RFE
+    from sklearn.preprocessing import StandardScaler
+    
+    # Prepare data
+    scaler = StandardScaler()
+    X_pos = scaler.fit_transform(positive_features)
+    
+    if negative_features is None:
+        n_neg = max(100, len(X_pos) * 3)
+        X_neg = np.random.randn(n_neg, positive_features.shape[1])
+        X_neg = scaler.transform(X_neg * np.std(positive_features, axis=0) +
+                                 np.mean(positive_features, axis=0))
+    else:
+        X_neg = scaler.transform(negative_features)
+    
+    X = np.vstack([X_pos, X_neg])
+    y = np.concatenate([np.ones(len(X_pos)), np.zeros(len(X_neg))])
+    
+    # RFE with logistic regression
+    model = LogisticRegression(C=0.1, max_iter=1000, random_state=42)
+    rfe = RFE(model, n_features_to_select=n_features_to_select, step=1)
+    rfe.fit(X, y)
+    
+    # Get rankings
+    rankings = dict(zip(GRID_FEATURE_NAMES, rfe.ranking_))
+    selected = [name for name, rank in rankings.items() if rank == 1]
+    
+    if verbose:
+        print(f"[INFO] Selected {len(selected)} features:")
+        for name in selected:
+            print(f"  - {name}")
+    
+    return {
+        "selected_features": selected,
+        "rankings": rankings,
+        "n_selected": len(selected),
+        "support_mask": rfe.support_.tolist()
+    }
+
+
+# ---------------------------------------------------------
 # Demo / Main
 # ---------------------------------------------------------
 

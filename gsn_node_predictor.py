@@ -84,6 +84,161 @@ ANGLE_DESCRIPTIONS = {
 
 
 # ---------------------------------------------------------
+# Robust Data Quality Utilities
+# ---------------------------------------------------------
+
+def safe_normalize(values: np.ndarray, method: str = "robust", 
+                   fallback: float = 0.0) -> np.ndarray:
+    """
+    Normalize array with NaN handling and outlier robustness.
+    
+    Args:
+        values: Input array (may contain NaN/Inf)
+        method: 'robust' (median/IQR), 'zscore' (mean/std), or 'minmax'
+        fallback: Value to use for invalid entries
+    
+    Returns:
+        Normalized array with no NaN values
+    """
+    values = np.asarray(values, dtype=np.float64)
+    result = np.full_like(values, fallback)
+    
+    # Mask for valid (finite) values
+    valid_mask = np.isfinite(values)
+    if not np.any(valid_mask):
+        return result
+    
+    valid_values = values[valid_mask]
+    
+    if method == "robust":
+        # Robust to outliers: use median and IQR
+        center = np.median(valid_values)
+        q75, q25 = np.percentile(valid_values, [75, 25])
+        scale = q75 - q25
+        if scale < 1e-10:
+            scale = np.std(valid_values)  # fallback to std if IQR is 0
+        if scale < 1e-10:
+            scale = 1.0  # constant array
+        result[valid_mask] = (values[valid_mask] - center) / scale
+    
+    elif method == "zscore":
+        center = np.mean(valid_values)
+        scale = np.std(valid_values)
+        if scale < 1e-10:
+            scale = 1.0
+        result[valid_mask] = (values[valid_mask] - center) / scale
+    
+    elif method == "minmax":
+        vmin, vmax = np.min(valid_values), np.max(valid_values)
+        scale = vmax - vmin
+        if scale < 1e-10:
+            scale = 1.0
+        result[valid_mask] = (values[valid_mask] - vmin) / scale
+    
+    return result
+
+
+def safe_divide(numerator: np.ndarray, denominator: np.ndarray, 
+                fallback: float = 0.0) -> np.ndarray:
+    """
+    Safe division handling zero denominators and NaN values.
+    
+    Args:
+        numerator: Numerator array
+        denominator: Denominator array  
+        fallback: Value to use when division is invalid
+    
+    Returns:
+        Result array with no NaN/Inf values
+    """
+    numerator = np.asarray(numerator, dtype=np.float64)
+    denominator = np.asarray(denominator, dtype=np.float64)
+    
+    # Create mask for valid divisions
+    valid_mask = (np.isfinite(numerator) & 
+                  np.isfinite(denominator) & 
+                  (np.abs(denominator) > 1e-10))
+    
+    result = np.full_like(numerator, fallback)
+    result[valid_mask] = numerator[valid_mask] / denominator[valid_mask]
+    
+    return result
+
+
+def validate_coordinates(lat: float, lon: float) -> tuple:
+    """
+    Validate and clamp coordinates to valid ranges.
+    
+    Args:
+        lat: Latitude in degrees
+        lon: Longitude in degrees
+    
+    Returns:
+        (lat, lon) clamped to valid ranges
+    """
+    # Clamp latitude to [-90, 90]
+    lat = max(-90.0, min(90.0, float(lat)))
+    
+    # Wrap longitude to [-180, 180]
+    lon = float(lon)
+    while lon > 180.0:
+        lon -= 360.0
+    while lon < -180.0:
+        lon += 360.0
+    
+    return lat, lon
+
+
+def impute_nan_grid(grid: np.ndarray, method: str = "nearest") -> np.ndarray:
+    """
+    Impute NaN values in a 2D grid.
+    
+    Args:
+        grid: 2D array potentially containing NaN
+        method: 'nearest' (neighbor interpolation), 'mean', or 'median'
+    
+    Returns:
+        Grid with NaN values filled
+    """
+    if not np.any(np.isnan(grid)):
+        return grid
+    
+    result = grid.copy()
+    nan_mask = np.isnan(result)
+    
+    if method == "mean":
+        fill_value = np.nanmean(result)
+        result[nan_mask] = fill_value
+    
+    elif method == "median":
+        fill_value = np.nanmedian(result)
+        result[nan_mask] = fill_value
+    
+    elif method == "nearest" and USE_SCIPY:
+        # Use scipy's distance transform for nearest neighbor
+        from scipy import ndimage
+        
+        # Get indices of valid values
+        valid_mask = ~nan_mask
+        if not np.any(valid_mask):
+            # All NaN - use 0
+            return np.zeros_like(grid)
+        
+        # Find nearest valid pixel for each NaN pixel
+        indices = ndimage.distance_transform_edt(
+            nan_mask, return_distances=False, return_indices=True
+        )
+        result = grid[tuple(indices)]
+    
+    else:
+        # Fallback: use mean
+        fill_value = np.nanmean(result) if np.any(np.isfinite(result)) else 0.0
+        result[nan_mask] = fill_value
+    
+    return result
+
+
+# ---------------------------------------------------------
 # Basic geometry helpers
 # ---------------------------------------------------------
 def deg2rad(deg):
@@ -885,12 +1040,21 @@ def compute_boundary_distance_grid(lats, lons):
     nlat, nlon = len(lats), len(lons)
     print(f"[INFO] Computing boundary distance grid ({nlat} x {nlon} = {nlat * nlon:,} points)...")
     
+    # Handle edge cases
+    if nlat < 2 or nlon < 2:
+        print("[WARN] Grid too small for boundary distance computation, using default")
+        return np.full((nlat, nlon), 500.0)
+    
     # Create a binary mask of boundary pixels
     # Map lat/lon to pixel indices
-    lat_min, lat_max = lats.min(), lats.max()
-    lon_min, lon_max = lons.min(), lons.max()
-    lat_res = (lat_max - lat_min) / (nlat - 1) if nlat > 1 else 1.0
-    lon_res = (lon_max - lon_min) / (nlon - 1) if nlon > 1 else 1.0
+    lat_min, lat_max = float(lats.min()), float(lats.max())
+    lon_min, lon_max = float(lons.min()), float(lons.max())
+    
+    # Safe resolution calculation
+    lat_range = lat_max - lat_min
+    lon_range = lon_max - lon_min
+    lat_res = lat_range / (nlat - 1) if lat_range > 1e-10 else 1.0
+    lon_res = lon_range / (nlon - 1) if lon_range > 1e-10 else 1.0
     
     # Initialize boundary mask (True = boundary pixel)
     boundary_mask = np.zeros((nlat, nlon), dtype=bool)
@@ -948,12 +1112,20 @@ def compute_boundary_distance_grid(lats, lons):
     # Latitude degree ~ 111 km everywhere
     # Longitude degree ~ 111 * cos(lat) km
     lat_km_per_pixel = lat_res * 111.0
-    lon_km_per_pixel = lon_res * 111.0 * np.cos(np.radians(lat_grid))
+    
+    # Clamp cos(lat) to avoid zero at poles (use minimum of ~0.01 for polar regions)
+    cos_lat = np.clip(np.abs(np.cos(np.radians(lat_grid))), 0.01, 1.0)
+    lon_km_per_pixel = lon_res * 111.0 * cos_lat
     
     # Approximate average pixel size (geometric mean)
-    avg_km_per_pixel = np.sqrt(lat_km_per_pixel * lon_km_per_pixel)
+    # Use safe multiplication to avoid negative values
+    product = np.maximum(lat_km_per_pixel * lon_km_per_pixel, 1e-10)
+    avg_km_per_pixel = np.sqrt(product)
     
     distance_km = pixel_distance * avg_km_per_pixel
+    
+    # Ensure no NaN values in output
+    distance_km = np.nan_to_num(distance_km, nan=500.0, posinf=20000.0, neginf=0.0)
     
     # Cache the result
     _boundary_distance_grid = distance_km
@@ -1034,7 +1206,12 @@ def compute_H_grid(lats, lons, sigma=6.0):
     # Average across nodes
     H_grid = H_sum / len(node_coords) if len(node_coords) > 0 else H_sum
     
-    print(f"[INFO] H grid complete: min={H_grid.min():.4f}, max={H_grid.max():.4f}")
+    # Ensure no NaN values
+    H_grid = np.nan_to_num(H_grid, nan=0.0, posinf=1.0, neginf=0.0)
+    
+    h_min = np.nanmin(H_grid) if np.any(np.isfinite(H_grid)) else 0.0
+    h_max = np.nanmax(H_grid) if np.any(np.isfinite(H_grid)) else 0.0
+    print(f"[INFO] H grid complete: min={h_min:.4f}, max={h_max:.4f}")
     
     return H_grid
 
@@ -1086,19 +1263,43 @@ def compute_G_grid(lats, lons, boundary_distance_grid=None, params=None):
     if boundary_distance_grid is None:
         boundary_distance_grid = compute_boundary_distance_grid(lats, lons)
     
-    # Handle NaN values
-    ga_grid = np.nan_to_num(ga_grid, nan=0.0)
-    ct_grid = np.nan_to_num(ct_grid, nan=p["ct_mean"])
+    # Handle NaN values with imputation
+    if np.any(np.isnan(ga_grid)):
+        print(f"[WARN] Found {np.isnan(ga_grid).sum()} NaN values in gravity grid, imputing...")
+        ga_grid = impute_nan_grid(ga_grid, method="nearest")
+    ga_grid = np.nan_to_num(ga_grid, nan=0.0, posinf=0.0, neginf=0.0)
     
-    # Compute normalized components
-    ga_norm = ga_grid / p["ga_scale"]
-    ct_norm = (ct_grid - p["ct_mean"]) / p["ct_std"]
-    tb_score = np.exp(-(boundary_distance_grid ** 2) / (2.0 * p["L"] * p["L"]))
+    if np.any(np.isnan(ct_grid)):
+        print(f"[WARN] Found {np.isnan(ct_grid).sum()} NaN values in crustal grid, imputing...")
+        ct_grid = impute_nan_grid(ct_grid, method="nearest")
+    ct_grid = np.nan_to_num(ct_grid, nan=p["ct_mean"], posinf=p["ct_mean"], neginf=p["ct_mean"])
+    
+    # Ensure boundary distance grid is clean
+    if np.any(~np.isfinite(boundary_distance_grid)):
+        print(f"[WARN] Found invalid values in boundary distance grid, fixing...")
+        boundary_distance_grid = np.nan_to_num(boundary_distance_grid, nan=500.0, posinf=20000.0, neginf=0.0)
+    
+    # Compute normalized components with safe division
+    ga_scale = max(abs(p["ga_scale"]), 1e-10)
+    ct_std = max(abs(p["ct_std"]), 1e-10)
+    L_squared = max(p["L"] * p["L"], 1e-10)
+    
+    ga_norm = ga_grid / ga_scale
+    ct_norm = (ct_grid - p["ct_mean"]) / ct_std
+    tb_score = np.exp(-(boundary_distance_grid ** 2) / (2.0 * L_squared))
+    
+    # Ensure all components are finite
+    ga_norm = np.nan_to_num(ga_norm, nan=0.0, posinf=10.0, neginf=-10.0)
+    ct_norm = np.nan_to_num(ct_norm, nan=0.0, posinf=10.0, neginf=-10.0)
+    tb_score = np.nan_to_num(tb_score, nan=0.0, posinf=1.0, neginf=0.0)
     
     # Compute G
     G_grid = p["w1"] * ga_norm + p["w2"] * ct_norm + p["w3"] * tb_score
+    G_grid = np.nan_to_num(G_grid, nan=0.0, posinf=100.0, neginf=-100.0)
     
-    print(f"[INFO] G grid complete: min={G_grid.min():.4f}, max={G_grid.max():.4f}")
+    g_min = np.nanmin(G_grid) if np.any(np.isfinite(G_grid)) else 0.0
+    g_max = np.nanmax(G_grid) if np.any(np.isfinite(G_grid)) else 0.0
+    print(f"[INFO] G grid complete: min={g_min:.4f}, max={g_max:.4f}")
     
     components = {
         "ga_norm": ga_norm,
